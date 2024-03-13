@@ -18,12 +18,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
-
-	"github.com/pkg/errors"
+	"os"
+	"strings"
 
 	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/pkg/errors"
 	commoncfg "github.com/prometheus/common/config"
 
 	"github.com/prometheus/alertmanager/config"
@@ -31,6 +32,9 @@ import (
 	"github.com/prometheus/alertmanager/template"
 	"github.com/prometheus/alertmanager/types"
 )
+
+// https://api.slack.com/reference/messaging/attachments#legacy_fields - 1024, no units given, assuming runes or characters.
+const maxTitleLenRunes = 1024
 
 // Notifier implements a Notifier for Slack notifications.
 type Notifier struct {
@@ -43,7 +47,7 @@ type Notifier struct {
 
 // New returns a new Slack notification handler.
 func New(c *config.SlackConfig, t *template.Template, l log.Logger, httpOpts ...commoncfg.HTTPClientOption) (*Notifier, error) {
-	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "slack", append(httpOpts, commoncfg.WithHTTP2Disabled())...)
+	client, err := commoncfg.NewClientFromConfig(*c.HTTPConfig, "slack", httpOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -92,13 +96,23 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		tmplText = notify.TmplText(n.tmpl, data, &err)
 	)
 	var markdownIn []string
+
 	if len(n.conf.MrkdwnIn) == 0 {
 		markdownIn = []string{"fallback", "pretext", "text"}
 	} else {
 		markdownIn = n.conf.MrkdwnIn
 	}
+
+	title, truncated := notify.TruncateInRunes(tmplText(n.conf.Title), maxTitleLenRunes)
+	if truncated {
+		key, err := notify.ExtractGroupKey(ctx)
+		if err != nil {
+			return false, err
+		}
+		level.Warn(n.logger).Log("msg", "Truncated title", "key", key, "max_runes", maxTitleLenRunes)
+	}
 	att := &attachment{
-		Title:      tmplText(n.conf.Title),
+		Title:      title,
 		TitleLink:  tmplText(n.conf.TitleLink),
 		Pretext:    tmplText(n.conf.Pretext),
 		Text:       tmplText(n.conf.Text),
@@ -111,9 +125,9 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		MrkdwnIn:   markdownIn,
 	}
 
-	var numFields = len(n.conf.Fields)
+	numFields := len(n.conf.Fields)
 	if numFields > 0 {
-		var fields = make([]config.SlackField, numFields)
+		fields := make([]config.SlackField, numFields)
 		for index, field := range n.conf.Fields {
 			// Check if short was defined for the field otherwise fallback to the global setting
 			var short bool
@@ -133,9 +147,9 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 		att.Fields = fields
 	}
 
-	var numActions = len(n.conf.Actions)
+	numActions := len(n.conf.Actions)
 	if numActions > 0 {
-		var actions = make([]config.SlackAction, numActions)
+		actions := make([]config.SlackAction, numActions)
 		for index, action := range n.conf.Actions {
 			slackAction := config.SlackAction{
 				Type:  tmplText(action.Type),
@@ -181,11 +195,11 @@ func (n *Notifier) Notify(ctx context.Context, as ...*types.Alert) (bool, error)
 	if n.conf.APIURL != nil {
 		u = n.conf.APIURL.String()
 	} else {
-		content, err := ioutil.ReadFile(n.conf.APIURLFile)
+		content, err := os.ReadFile(n.conf.APIURLFile)
 		if err != nil {
 			return false, err
 		}
-		u = string(content)
+		u = strings.TrimSpace(string(content))
 	}
 
 	resp, err := notify.PostJSON(ctx, n.client, u, &buf)
